@@ -1,13 +1,13 @@
 #!/bin/bash
-
-# InvoiceNinja Restoration Script
-set -e  # Exit on any error
+# InvoiceNinja Restoration Script with Backup Selection
+set -e # Exit on any error
 
 # Configuration
-BACKUP_DIR="/home/invoiceninja/backups"  # Fixed path without trailing slash
-IN_APP_CONTAINER="debian-app-1"       # Change to your app container name
-IN_DB_CONTAINER="debian-mysql-1"         # Change to your database container name
-DB_BACKUP_FILE="db_backup.sql.gz"         # Your database backup file
+ARCHIVE_DIR="/home/invoiceninja/backups" # Directory containing backup archives (no trailing slash)
+IN_APP_CONTAINER="debian-app-1" # Change to your app container name
+IN_DB_CONTAINER="debian-mysql-1" # Change to your database container name
+DB_BACKUP_FILE="db_backup.sql.gz" # Your database backup file
+BACKUP_PATTERN="*.tar.gz" # Pattern for backup files (adjust if needed, e.g., "*.zip")
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,24 +15,67 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${YELLOW}Starting InvoiceNinja Restoration...${NC}"
+echo -e "${YELLOW}Starting InvoiceNinja Restoration with Backup Selection...${NC}"
 
 # Remove any double slashes from path and ensure no trailing slash
-BACKUP_DIR=$(echo "$BACKUP_DIR" | sed 's#//#/#g')
-BACKUP_DIR="${BACKUP_DIR%/}"
+ARCHIVE_DIR=$(echo "$ARCHIVE_DIR" | sed 's#//#/#g')
+ARCHIVE_DIR="${ARCHIVE_DIR%/}"
 
-echo -e "${YELLOW}Using backup directory: $BACKUP_DIR${NC}"
+echo -e "${YELLOW}Using archive directory: $ARCHIVE_DIR${NC}"
 
-# Check if backup directory exists
-if [ ! -d "$BACKUP_DIR" ]; then
-    echo -e "${RED}Backup directory not found: $BACKUP_DIR${NC}"
+# Check if archive directory exists
+if [ ! -d "$ARCHIVE_DIR" ]; then
+    echo -e "${RED}Archive directory not found: $ARCHIVE_DIR${NC}"
     echo -e "${YELLOW}Available directories in /home/invoiceninja/:${NC}"
     ls -la "/home/invoiceninja/" 2>/dev/null || echo "Cannot access /home/invoiceninja/"
     exit 1
 fi
 
+# Find backup archives
+mapfile -t archives < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -name "$BACKUP_PATTERN" | sort)
+
+if [ ${#archives[@]} -eq 0 ]; then
+    echo -e "${RED}No backup archives found in $ARCHIVE_DIR matching $BACKUP_PATTERN${NC}"
+    echo -e "${YELLOW}Contents of archive directory:${NC}"
+    ls -la "$ARCHIVE_DIR"
+    exit 1
+fi
+
+# Display selection menu
+echo -e "${YELLOW}Available backups:${NC}"
+select chosen_archive in "${archives[@]}"; do
+    if [[ -n "$chosen_archive" ]]; then
+        echo -e "${GREEN}Selected backup: $chosen_archive${NC}"
+        break
+    else
+        echo -e "${RED}Invalid selection. Please choose a number from the list.${NC}"
+    fi
+done
+
+# Create temporary directory for decompression
+temp_dir="/tmp/in_restore_$$"
+mkdir -p "$temp_dir"
+trap 'rm -rf "$temp_dir"' EXIT  # Cleanup on exit
+
+# Decompress the chosen archive
+echo -e "${YELLOW}Decompressing selected backup...${NC}"
+if [[ "$chosen_archive" == *.tar.gz ]]; then
+    tar -xzf "$chosen_archive" -C "$temp_dir"
+elif [[ "$chosen_archive" == *.zip ]]; then
+    unzip -q "$chosen_archive" -d "$temp_dir"
+else
+    echo -e "${RED}Unsupported archive format. Please adjust BACKUP_PATTERN.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Decompression complete.${NC}"
+
+# Set BACKUP_DIR to the temporary directory
+BACKUP_DIR="$temp_dir"
+
+# Now proceed with the original restoration logic...
+
 # List contents of backup directory for debugging
-echo -e "${YELLOW}Contents of backup directory:${NC}"
+echo -e "${YELLOW}Contents of extracted backup directory:${NC}"
 ls -la "$BACKUP_DIR"
 
 # Check if containers are running
@@ -42,14 +85,12 @@ if ! docker ps --format 'table {{.Names}}' | grep -q "$IN_APP_CONTAINER"; then
     docker ps --format 'table {{.Names}}\t{{.Status}}'
     exit 1
 fi
-
 if ! docker ps --format 'table {{.Names}}' | grep -q "$IN_DB_CONTAINER"; then
     echo -e "${RED}Database container '$IN_DB_CONTAINER' is not running${NC}"
     echo -e "${YELLOW}Running containers:${NC}"
     docker ps --format 'table {{.Names}}\t{{.Status}}'
     exit 1
 fi
-
 echo -e "${GREEN}Containers found and running${NC}"
 
 # Function to run commands in app container with proper user
@@ -98,19 +139,18 @@ fi
 echo -e "${YELLOW}⏳ Restoring database...${NC}"
 DB_BACKUP_PATH="$BACKUP_DIR/$DB_BACKUP_FILE"
 echo -e "${YELLOW}Looking for database file: $DB_BACKUP_PATH${NC}"
-
 if [ -f "$DB_BACKUP_PATH" ]; then
     echo -e "${GREEN}✅ Database backup file found${NC}"
-    
+   
     # Extract database credentials from .env file in container
     echo -e "${YELLOW}Extracting database credentials...${NC}"
     DB_HOST=$(run_in_app_container grep DB_HOST /var/www/html/.env | cut -d '=' -f2)
     DB_DATABASE=$(run_in_app_container grep DB_DATABASE /var/www/html/.env | cut -d '=' -f2)
     DB_USERNAME=$(run_in_app_container grep DB_USERNAME /var/www/html/.env | cut -d '=' -f2)
     DB_PASSWORD=$(run_in_app_container grep DB_PASSWORD /var/www/html/.env | cut -d '=' -f2 | sed 's/^"\|"$//g')
-    
+   
     echo -e "${YELLOW}📦 Database detected: $DB_DATABASE on host: $DB_HOST${NC}"
-    
+   
     # Check what type of compression we have
     if [[ "$DB_BACKUP_FILE" == *".qz" ]]; then
         echo -e "${YELLOW}Detected .qz compression, using qpress...${NC}"
@@ -144,7 +184,7 @@ if [ -f "$DB_BACKUP_PATH" ]; then
         docker exec $IN_DB_CONTAINER bash -c "zcat /tmp/db_backup.sql.gz | mysql -h $DB_HOST -u $DB_USERNAME -p$DB_PASSWORD $DB_DATABASE"
         docker exec $IN_DB_CONTAINER rm -f /tmp/db_backup.sql.gz
     fi
-    
+   
     echo -e "${GREEN}✅ Database restored successfully${NC}"
 else
     echo -e "${RED}❌ Database backup file not found: $DB_BACKUP_PATH${NC}"
